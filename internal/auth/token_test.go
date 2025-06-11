@@ -42,3 +42,14 @@ func TestGetBearerToken(t *testing.T) {
 		})
 	}
 }
+
+func TestMakeRefreshToken(t *testing.T) {
+	token, err := MakeRefreshToken()
+	if err != nil {
+		t.Fatalf("unexpected error generating token: %v", err)
+	}
+
+	if len(token) != 64 {
+		t.Fatalf("expected token length of 64, got %d", len(token))
+	}
+}
