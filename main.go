@@ -18,8 +18,9 @@ import (
 )
 
 type apiConfig struct {
-	DB       *database.Queries
-	Platform string
+	DB        *database.Queries
+	Platform  string
+	JWTSecret string
 }
 
 // User response struct (no password!)
@@ -45,6 +46,10 @@ func main() {
 
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET is not set in environment")
+	}
 
 	if dbURL == "" {
 		log.Fatal("DB_URL is not set in environment")
@@ -62,8 +67,9 @@ func main() {
 
 	dbQueries := database.New(db)
 	cfg := apiConfig{
-		DB:       dbQueries,
-		Platform: platform,
+		DB:        dbQueries,
+		Platform:  platform,
+		JWTSecret: jwtSecret,
 	}
 
 	mux := http.NewServeMux()
@@ -119,8 +125,9 @@ func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 
 func (cfg *apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email            string `json:"email"`
+		Password         string `json:"password"`
+		ExpiresInSeconds int    `json:"expires_in_seconds"`
 	}
 	var req request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" || req.Password == "" {
@@ -129,26 +136,41 @@ func (cfg *apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := cfg.DB.GetUserByEmail(r.Context(), req.Email)
+	if err != nil || auth.CheckPasswordHash(user.HashedPassword, req.Password) != nil {
+		http.Error(w, "Incorrect email or password", http.StatusUnauthorized)
+		return
+	}
+
+	// Determine token expiration
+	expiry := time.Hour
+	if req.ExpiresInSeconds > 0 && req.ExpiresInSeconds <= 3600 {
+		expiry = time.Duration(req.ExpiresInSeconds) * time.Second
+	}
+
+	token, err := auth.MakeJWT(user.ID, cfg.JWTSecret, expiry)
 	if err != nil {
-		http.Error(w, "Incorrect email or password", http.StatusUnauthorized)
+		http.Error(w, "Failed to create token", http.StatusInternalServerError)
 		return
 	}
 
-	if err := auth.CheckPasswordHash(user.HashedPassword, req.Password); err != nil {
-		http.Error(w, "Incorrect email or password", http.StatusUnauthorized)
-		return
+	type response struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+		Token     string    `json:"token"`
 	}
-
-	apiUser := User{
+	resp := response{
 		ID:        user.ID,
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email:     user.Email,
+		Token:     token,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(apiUser)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (cfg *apiConfig) handleReset(w http.ResponseWriter, r *http.Request) {
@@ -166,12 +188,23 @@ func (cfg *apiConfig) handleReset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) handleCreateChirp(w http.ResponseWriter, r *http.Request) {
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	userID, err := auth.ValidateJWT(tokenStr, cfg.JWTSecret)
+	if err != nil {
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
 	type request struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 	var req request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" || req.UserID == uuid.Nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
@@ -180,6 +213,7 @@ func (cfg *apiConfig) handleCreateChirp(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Chirp too long", http.StatusBadRequest)
 		return
 	}
+
 	bannedWords := []string{"kerfuffle", "sharbert", "fornax"}
 	for _, word := range bannedWords {
 		if strings.Contains(strings.ToLower(req.Body), word) {
@@ -190,7 +224,7 @@ func (cfg *apiConfig) handleCreateChirp(w http.ResponseWriter, r *http.Request) 
 
 	chirp, err := cfg.DB.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   req.Body,
-		UserID: uuid.NullUUID{UUID: req.UserID, Valid: true},
+		UserID: uuid.NullUUID{UUID: userID, Valid: true},
 	})
 	if err != nil {
 		http.Error(w, "Failed to create chirp", http.StatusInternalServerError)
